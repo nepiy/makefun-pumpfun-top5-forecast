@@ -161,8 +161,8 @@ for (const coin of candidates) {
   );
 }
 
-// More simulations smooth the Monte Carlo noise in the place shares.
-const SIMULATIONS = 12_000;
+// 15,000 simulations smooth the Monte Carlo noise in the place shares.
+const SIMULATIONS = 15_000;
 const counts = new Map(candidates.map((coin) => [coin.mint, new Uint32Array(task.places)]));
 const placeSamples = Array.from({ length: task.places }, () => new Float64Array(SIMULATIONS));
 const simulated = candidates.map((coin) => ({ coin, size: 0 }));

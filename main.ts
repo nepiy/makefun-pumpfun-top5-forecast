@@ -1,256 +1,447 @@
-// Deterministic Monte Carlo forecast for make.fun's pumpfun top-5 competition.
-// Runs with Node 22 and the standard library only.
+const fs = require("node:fs");
+const path = require("node:path");
 
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+const SIMULATION_COUNT = 12000;
+const SEED = 20261112;
+const PLACES = 5;
+const MIN_REPORTED_PROBABILITY = 0.0006;
+const PROBABILITY_SCALE = 1000000;
 
-const INPUT_DIR = process.env.MAKEFUN_INPUT_DIR ?? '/input';
-const OUTPUT_DIR = process.env.MAKEFUN_OUTPUT_DIR ?? '/output';
-const MICRO = 1_000_000;
-
-const clamp = (value: number, low: number, high: number): number => Math.max(low, Math.min(high, value));
-
-function sizeOf(lamports: string | number): number {
-  return Math.log10(Number(BigInt(lamports))) - 9;
+function clamp(value, minimum, maximum) {
+  return Math.max(minimum, Math.min(maximum, value));
 }
 
-function mulberry32(seed: number): () => number {
+function parsedTime(value) {
+  const milliseconds = Date.parse(value);
+  return Number.isFinite(milliseconds) ? milliseconds : null;
+}
+
+function standardDeviation(values) {
+  if (values.length === 0) return 0;
+  const mean = values.reduce((sum, value) => sum + value, 0) / values.length;
+  const variance =
+    values.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+    values.length;
+  return Math.sqrt(variance);
+}
+
+function mulberry32(seed) {
   let state = seed >>> 0;
-  return () => {
-    state = (state + 0x6D2B79F5) | 0;
-    let value = state;
+  return function random() {
+    let value = (state += 0x6d2b79f5);
     value = Math.imul(value ^ (value >>> 15), value | 1);
     value ^= value + Math.imul(value ^ (value >>> 7), value | 61);
     return ((value ^ (value >>> 14)) >>> 0) / 4294967296;
   };
 }
 
-const task = JSON.parse(readFileSync(join(INPUT_DIR, 'task.json'), 'utf8')) as {
-  places: number;
-  output: string;
-  history_until: string;
-  reads: string[];
-  size: { edges: number[] };
-};
-const lines = readFileSync(join(INPUT_DIR, 'history.ndjson'), 'utf8').split('\n').filter((line) => line !== '');
-const marks = lines
-  .map((line) => JSON.parse(line) as { at: string; ok: boolean; rows: Array<Record<string, unknown>> | null })
-  .filter((mark) => mark.ok === true && Array.isArray(mark.rows) && mark.rows.length > 0)
-  .sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-if (marks.length === 0) throw new Error('the history holds no ok mark with rows');
-
-const firstTime = Date.parse(marks[0]!.at);
-const timeOf = (iso: string): number => (Date.parse(iso) - firstTime) / 3_600_000;
-const horizon = Math.max(
-  0.1,
-  task.reads.reduce((sum, read) => sum + (Date.parse(read) - Date.parse(task.history_until)) / 3_600_000, 0) / task.reads.length,
-);
-const observationsByMint = new Map<string, Array<{ time: number; size: number; rank: number }>>();
-const metadataByMint = new Map<string, { pool: boolean; createdAt: string | null }>();
-const lastMark = marks[marks.length - 1]!;
-const lastRows = (lastMark.rows as Array<Record<string, unknown>>).slice().sort((a, b) => Number(a.rank) - Number(b.rank));
-
-for (const mark of marks) {
-  const time = timeOf(mark.at);
-  for (const row of mark.rows as Array<Record<string, unknown>>) {
-    const mint = String(row.mint);
-    const size = sizeOf(row.market_cap_lamports as string | number);
-    const observations = observationsByMint.get(mint) ?? [];
-    observations.push({ time, size, rank: Number(row.rank) });
-    observationsByMint.set(mint, observations);
-    const metadata = metadataByMint.get(mint) ?? { pool: false, createdAt: null };
-    metadata.pool ||= row.venue === 'pool' || row.complete === true;
-    if (typeof row.created_at === 'string' && (metadata.createdAt === null || row.created_at < metadata.createdAt)) {
-      metadata.createdAt = row.created_at;
-    }
-    metadataByMint.set(mint, metadata);
-  }
-}
-
-const smallestLastSize = Math.min(...lastRows.map((row) => sizeOf(row.market_cap_lamports as string | number)));
-const lastMintSet = new Set(lastRows.map((row) => String(row.mint)));
-const features = new Map<string, {
-  mint: string;
-  lastRank: number;
-  lastY: number;
-  slope: number;
-  vol: number;
-  pool: boolean;
-  createdAt: string | null;
-}>();
-
-for (const [mint, observations] of observationsByMint) {
-  const recent = observations.slice(-4);
-  let slope = 0;
-  if (recent.length >= 2) {
-    const meanTime = recent.reduce((sum, observation) => sum + observation.time, 0) / recent.length;
-    const meanSize = recent.reduce((sum, observation) => sum + observation.size, 0) / recent.length;
-    const denominator = recent.reduce((sum, observation) => sum + (observation.time - meanTime) ** 2, 0);
-    if (denominator > 0) {
-      slope = recent.reduce((sum, observation) => sum + (observation.time - meanTime) * (observation.size - meanSize), 0) / denominator;
-    }
-  }
-  const rates: number[] = [];
-  for (let index = 1; index < observations.length; index++) {
-    const previous = observations[index - 1]!;
-    const current = observations[index]!;
-    const dt = current.time - previous.time;
-    if (dt > 0) rates.push((current.size - previous.size) / Math.sqrt(dt));
-  }
-  let vol = 0.3;
-  if (observations.length >= 2 && rates.length > 0) {
-    const meanRate = rates.reduce((sum, rate) => sum + rate, 0) / rates.length;
-    const variance = rates.reduce((sum, rate) => sum + (rate - meanRate) ** 2, 0) / rates.length;
-    vol = clamp(Math.sqrt(variance), 0.08, 1.2);
-  }
-  const lastObservation = observations[observations.length - 1]!;
-  features.set(mint, {
-    mint,
-    lastRank: lastObservation.rank,
-    lastY: lastObservation.size,
-    slope,
-    vol,
-    pool: metadataByMint.get(mint)!.pool,
-    createdAt: metadataByMint.get(mint)!.createdAt,
-  });
-}
-
-const random = mulberry32(20261112);
-const normal = (() => {
-  let spare: number | null = null;
-  return (): number => {
+function makeNormalGenerator(random) {
+  let spare = null;
+  return function normal() {
     if (spare !== null) {
       const value = spare;
       spare = null;
       return value;
     }
-    const u = Math.max(Number.MIN_VALUE, random());
-    const v = random();
-    const magnitude = Math.sqrt(-2 * Math.log(u));
-    spare = magnitude * Math.sin(2 * Math.PI * v);
-    return magnitude * Math.cos(2 * Math.PI * v);
+    const radius = Math.sqrt(-2 * Math.log(1 - random()));
+    const angle = 2 * Math.PI * random();
+    spare = radius * Math.sin(angle);
+    return radius * Math.cos(angle);
   };
-})();
-
-const bestRankByMint = new Map<string, number>();
-for (const [mint, observations] of observationsByMint) {
-  bestRankByMint.set(mint, Math.min(...observations.map((observation) => observation.rank)));
 }
-const candidates = [...features.values()]
-  .filter((coin) => lastMintSet.has(coin.mint) || (bestRankByMint.get(coin.mint) ?? Infinity) <= 12)
-  .sort((a, b) => a.lastRank - b.lastRank || a.mint.localeCompare(b.mint))
-  .slice(0, 220)
-  .map((coin) => ({
-    ...coin,
-    lastY: lastMintSet.has(coin.mint) ? coin.lastY : Math.min(coin.lastY, smallestLastSize),
-    mu: 0,
-    sigma: 0,
-    pCrash: 0,
-  }));
-if (candidates.length < task.places) throw new Error('the history holds fewer candidates than forecast places');
 
-for (const coin of candidates) {
-  const drift = clamp(0.5 * clamp(coin.slope, -0.9, 0.9) * Math.min(horizon, 2.5), -0.55, 0.5);
-  coin.mu = coin.lastY + drift + (coin.pool ? 0.03 : 0);
-  // Volatility growth flattens after a few hours.
-  coin.sigma = clamp((0.3 + 0.55 * coin.vol) * Math.sqrt(Math.min(horizon, 4) + 0.25), 0.22, 1.35) * (coin.pool ? 0.92 : 1.08);
-  coin.pCrash = clamp(
-    (coin.pool ? 0.05 : 0.13) * (0.7 + 0.3 * Math.sqrt(horizon)) + (coin.slope < -0.2 ? 0.06 : 0),
-    0.04,
-    0.35,
+function erfc(value) {
+  const absolute = Math.abs(value);
+  const t = 1 / (1 + 0.5 * absolute);
+  const answer =
+    t *
+    Math.exp(
+      -absolute * absolute -
+        1.26551223 +
+        t *
+          (1.00002368 +
+            t *
+              (0.37409196 +
+                t *
+                  (0.09678418 +
+                    t *
+                      (-0.18628806 +
+                        t *
+                          (0.27886807 +
+                            t *
+                              (-1.13520398 +
+                                t *
+                                  (1.48851587 +
+                                    t * (-0.82215223 + t * 0.17087277)))))))),
+    );
+  return value >= 0 ? answer : 2 - answer;
+}
+
+function normalCdfAt(value, mean, deviation) {
+  const z = (value - mean) / (deviation * Math.SQRT2);
+  return 0.5 * erfc(-z);
+}
+
+function floorProbability(value) {
+  return Math.floor(value * PROBABILITY_SCALE) / PROBABILITY_SCALE;
+}
+
+function sizeToBin(value, edges) {
+  let low = 0;
+  let high = edges.length;
+  while (low < high) {
+    const middle = (low + high) >>> 1;
+    if (value >= edges[middle]) low = middle + 1;
+    else high = middle;
+  }
+  return low;
+}
+
+function readMarks(historyText) {
+  const marks = [];
+  for (const line of historyText.split(/\r?\n/)) {
+    if (!line.trim()) continue;
+    try {
+      const mark = JSON.parse(line);
+      if (
+        mark &&
+        mark.ok === true &&
+        Array.isArray(mark.rows) &&
+        mark.rows.length > 0 &&
+        typeof mark.at === "string"
+      ) {
+        marks.push(mark);
+      }
+    } catch {
+      // Ignore malformed lines; only valid successful marks are observations.
+    }
+  }
+  marks.sort((left, right) => left.at.localeCompare(right.at));
+  return marks;
+}
+
+function horizonHours(task) {
+  const historyTime = parsedTime(task.history_until);
+  const readTimes = Array.isArray(task.reads)
+    ? task.reads.map(parsedTime).filter((time) => time !== null)
+    : [];
+  if (historyTime === null || readTimes.length === 0) return 0.1;
+  const meanDifference =
+    readTimes.reduce((sum, time) => sum + (time - historyTime), 0) /
+    readTimes.length /
+    3600000;
+  return Math.max(0.1, meanDifference);
+}
+
+function collectCoins(marks) {
+  const coins = new Map();
+  const lastMarkByMint = new Map();
+  let lastSmallestSize = Infinity;
+  const firstMarkTime = parsedTime(marks[0].at);
+
+  for (let markIndex = 0; markIndex < marks.length; markIndex += 1) {
+    const mark = marks[markIndex];
+    const markTime = parsedTime(mark.at);
+    if (markTime === null) continue;
+    const timeHours =
+      firstMarkTime === null ? 0 : (markTime - firstMarkTime) / 3600000;
+    const seenThisMark = new Set();
+
+    for (const row of mark.rows) {
+      if (!row || typeof row.mint !== "string" || !row.mint) continue;
+      let marketCap;
+      try {
+        marketCap = Number(BigInt(row.market_cap_lamports));
+      } catch {
+        continue;
+      }
+      if (!(marketCap > 0) || !Number.isFinite(marketCap)) continue;
+      const size = Math.log10(marketCap) - 9;
+      const rank = Number(row.rank);
+      if (!Number.isFinite(size) || !Number.isFinite(rank)) continue;
+
+      let coin = coins.get(row.mint);
+      if (!coin) {
+        coin = {
+          mint: row.mint,
+          observations: [],
+          pool: false,
+          createdAt: null,
+          bestRank: Infinity,
+          lastObservation: null,
+        };
+        coins.set(row.mint, coin);
+      }
+      coin.observations.push({ time: timeHours, size, rank });
+      coin.bestRank = Math.min(coin.bestRank, rank);
+      coin.pool = coin.pool || row.venue === "pool" || row.complete === true;
+      if (coin.createdAt === null && typeof row.created_at === "string") {
+        coin.createdAt = row.created_at;
+      }
+      coin.lastObservation = { time: timeHours, size, rank };
+
+      if (markIndex === marks.length - 1) {
+        lastSmallestSize = Math.min(lastSmallestSize, size);
+        if (!seenThisMark.has(row.mint)) {
+          const existing = lastMarkByMint.get(row.mint);
+          if (!existing || rank < existing.rank) {
+            lastMarkByMint.set(row.mint, { size, rank });
+          }
+          seenThisMark.add(row.mint);
+        }
+      }
+    }
+  }
+
+  const candidates = [];
+  for (const coin of coins.values()) {
+    const lastMarkObservation = lastMarkByMint.get(coin.mint);
+    if (lastMarkObservation) {
+      candidates.push({
+        ...coin,
+        lastY: lastMarkObservation.size,
+        lastRank: lastMarkObservation.rank,
+      });
+    } else if (coin.bestRank <= 12 && coin.lastObservation) {
+      candidates.push({
+        ...coin,
+        lastY: Math.min(coin.lastObservation.size, lastSmallestSize),
+        lastRank: coin.lastObservation.rank,
+      });
+    }
+  }
+
+  candidates.sort(
+    (left, right) =>
+      left.lastRank - right.lastRank || left.mint.localeCompare(right.mint),
   );
+  return candidates.slice(0, 220);
 }
 
-// 15,000 simulations smooth the Monte Carlo noise in the place shares.
-const SIMULATIONS = 15_000;
-const counts = new Map(candidates.map((coin) => [coin.mint, new Uint32Array(task.places)]));
-const placeSamples = Array.from({ length: task.places }, () => new Float64Array(SIMULATIONS));
-const simulated = candidates.map((coin) => ({ coin, size: 0 }));
-for (let simulation = 0; simulation < SIMULATIONS; simulation++) {
-  for (const item of simulated) {
-    const coin = item.coin;
-    if (random() < coin.pCrash) {
-      item.size = coin.mu - 0.9 - 1.3 * random();
-    } else {
-      const tailScale = random() < 0.18 ? 1.9 : 1;
-      item.size = coin.mu + coin.sigma * normal() * tailScale;
-    }
-  }
-  const ranking = simulated.slice().sort((a, b) => b.size - a.size || a.coin.mint.localeCompare(b.coin.mint));
-  for (let placeIndex = 0; placeIndex < task.places; placeIndex++) {
-    const winner = ranking[placeIndex]!;
-    counts.get(winner.coin.mint)![placeIndex]!++;
-    placeSamples[placeIndex]![simulation] = winner.size;
-  }
-}
-
-const probabilities: Array<{ mint: string; place: number; p: number }> = [];
-for (let place = 1; place <= task.places; place++) {
-  const reserve = clamp(0.4 + 0.03 * (place - 1) + 0.07 * Math.sqrt(horizon), 0.4, 0.66);
-  const rows = candidates
-    .map((coin) => ({
-      mint: coin.mint,
-      place,
-      p: Math.floor((counts.get(coin.mint)![place - 1]! / SIMULATIONS) * (1 - reserve) * MICRO) / MICRO,
-    }))
-    .filter((row) => row.p >= 0.0006)
-    .sort((a, b) => b.p - a.p || a.mint.localeCompare(b.mint))
-    .slice(0, 100);
-  probabilities.push(...rows);
-}
-
-const chosen = new Set<string>();
-const top5: string[] = [];
-for (let placeIndex = 0; placeIndex < task.places; placeIndex++) {
-  let bestMint: string | null = null;
-  let bestCount = -1;
+function addSimulationParameters(candidates, horizon) {
   for (const coin of candidates) {
-    if (chosen.has(coin.mint)) continue;
-    const count = counts.get(coin.mint)![placeIndex]!;
-    if (count > bestCount || (count === bestCount && (bestMint === null || coin.mint < bestMint))) {
-      bestCount = count;
-      bestMint = coin.mint;
+    const observations = coin.observations.slice(-4);
+    let slope = 0;
+    if (observations.length >= 2) {
+      const meanTime =
+        observations.reduce((sum, item) => sum + item.time, 0) /
+        observations.length;
+      const meanSize =
+        observations.reduce((sum, item) => sum + item.size, 0) /
+        observations.length;
+      let numerator = 0;
+      let denominator = 0;
+      for (const observation of observations) {
+        const deltaTime = observation.time - meanTime;
+        numerator += deltaTime * (observation.size - meanSize);
+        denominator += deltaTime * deltaTime;
+      }
+      if (denominator > 0) slope = numerator / denominator;
+    }
+
+    let volatility = 0.3;
+    if (observations.length >= 2) {
+      const increments = [];
+      for (let index = 1; index < observations.length; index += 1) {
+        const deltaTime =
+          observations[index].time - observations[index - 1].time;
+        if (deltaTime > 0) {
+          increments.push(
+            (observations[index].size - observations[index - 1].size) /
+              Math.sqrt(deltaTime),
+          );
+        }
+      }
+      volatility = clamp(standardDeviation(increments), 0.08, 1.2);
+    }
+
+    const poolAdjustment = coin.pool ? 0.03 : 0;
+    const drift = clamp(
+      0.5 * clamp(slope, -0.9, 0.9) * Math.min(horizon, 2.5),
+      -0.55,
+      0.5,
+    );
+    const sigma =
+      clamp(
+        (0.3 + 0.55 * volatility) *
+          Math.sqrt(Math.min(horizon, 4) + 0.25),
+        0.22,
+        1.35,
+      ) * (coin.pool ? 0.92 : 1.08);
+    const pCrash = clamp(
+      (coin.pool ? 0.05 : 0.13) * (0.7 + 0.3 * Math.sqrt(horizon)) +
+        (slope < -0.2 ? 0.06 : 0),
+      0.04,
+      0.35,
+    );
+
+    coin.slope = slope;
+    coin.volatility = volatility;
+    coin.mu = coin.lastY + drift + poolAdjustment;
+    coin.sigma = sigma;
+    coin.pCrash = pCrash;
+  }
+}
+
+function simulate(candidates, horizon, edges, taskPlaces) {
+  if (candidates.length < taskPlaces) {
+    throw new Error("Not enough observed candidates to produce a distinct top5.");
+  }
+  addSimulationParameters(candidates, horizon);
+  const random = mulberry32(SEED);
+  const normal = makeNormalGenerator(random);
+  const counts = candidates.map(() => new Uint32Array(taskPlaces));
+  const placeSizes = Array.from(
+    { length: taskPlaces },
+    () => new Float64Array(SIMULATION_COUNT),
+  );
+  const sampledSizes = new Float64Array(candidates.length);
+  const ranked = new Array(candidates.length);
+
+  for (let simulation = 0; simulation < SIMULATION_COUNT; simulation += 1) {
+    for (let index = 0; index < candidates.length; index += 1) {
+      const coin = candidates[index];
+      if (random() < coin.pCrash) {
+        sampledSizes[index] = coin.mu - 0.9 - 1.3 * random();
+      } else {
+        let z = normal();
+        if (random() < 0.18) z *= 1.9;
+        sampledSizes[index] = coin.mu + coin.sigma * z;
+      }
+      ranked[index] = index;
+    }
+
+    ranked.sort(
+      (left, right) =>
+        sampledSizes[right] - sampledSizes[left] ||
+        candidates[left].mint.localeCompare(candidates[right].mint),
+    );
+    for (let place = 0; place < taskPlaces; place += 1) {
+      const candidateIndex = ranked[place];
+      counts[candidateIndex][place] += 1;
+      placeSizes[place][simulation] = sampledSizes[candidateIndex];
     }
   }
-  if (bestMint !== null) {
-    chosen.add(bestMint);
-    top5.push(bestMint);
+
+  const probabilities = [];
+  for (let place = 0; place < taskPlaces; place += 1) {
+    const reserve = clamp(
+      0.4 + 0.03 * place + 0.07 * Math.sqrt(horizon),
+      0.4,
+      0.66,
+    );
+    const rows = [];
+    for (let index = 0; index < candidates.length; index += 1) {
+      const probability = floorProbability(
+        (counts[index][place] / SIMULATION_COUNT) * (1 - reserve),
+      );
+      if (probability >= MIN_REPORTED_PROBABILITY) {
+        rows.push({
+          mint: candidates[index].mint,
+          place: place + 1,
+          p: probability,
+        });
+      }
+    }
+    rows.sort(
+      (left, right) =>
+        right.p - left.p || left.mint.localeCompare(right.mint),
+    );
+    probabilities.push(...rows.slice(0, 100));
   }
+
+  const top5 = [];
+  const used = new Set();
+  for (let place = 0; place < taskPlaces; place += 1) {
+    let bestIndex = -1;
+    for (let index = 0; index < candidates.length; index += 1) {
+      if (used.has(index)) continue;
+      if (
+        bestIndex === -1 ||
+        counts[index][place] > counts[bestIndex][place] ||
+        (counts[index][place] === counts[bestIndex][place] &&
+          candidates[index].mint.localeCompare(candidates[bestIndex].mint) < 0)
+      ) {
+        bestIndex = index;
+      }
+    }
+    used.add(bestIndex);
+    top5.push(candidates[bestIndex].mint);
+  }
+
+  const sizes = [];
+  for (let place = 0; place < taskPlaces; place += 1) {
+    const values = placeSizes[place];
+    const mean =
+      values.reduce((sum, value) => sum + value, 0) / SIMULATION_COUNT;
+    const variance =
+      values.reduce((sum, value) => sum + (value - mean) ** 2, 0) /
+      SIMULATION_COUNT;
+    const wideDeviation = Math.sqrt(variance) * 1.5 + 0.08;
+    const empiricalBins = new Uint32Array(edges.length + 1);
+    for (const value of values) empiricalBins[sizeToBin(value, edges)] += 1;
+
+    let lowerCdf = 0;
+    for (let bin = 0; bin <= edges.length; bin += 1) {
+      let wideShare;
+      if (bin === 0) {
+        const upperCdf = normalCdfAt(edges[0], mean, wideDeviation);
+        wideShare = upperCdf;
+        lowerCdf = upperCdf;
+      } else if (bin === edges.length) {
+        wideShare = 1 - lowerCdf;
+      } else {
+        const upperCdf = normalCdfAt(edges[bin], mean, wideDeviation);
+        wideShare = upperCdf - lowerCdf;
+        lowerCdf = upperCdf;
+      }
+      const empiricalShare = empiricalBins[bin] / SIMULATION_COUNT;
+      const probability = floorProbability(
+        0.68 * empiricalShare + 0.32 * Math.max(0, wideShare),
+      );
+      if (probability > 0) {
+        sizes.push({ place: place + 1, bin, p: probability });
+      }
+    }
+  }
+
+  return { probabilities, top5, sizes };
 }
 
-/** erfc(x), Numerical Recipes' erfcc approximation. */
-function erfc(x: number): number {
-  const z = Math.abs(x);
-  const t = 1 / (1 + 0.5 * z);
-  const r = t * Math.exp(-z * z - 1.26551223 + t * (1.00002368 + t * (0.37409196 + t * (0.09678418 + t * (-0.18628806 + t * (0.27886807 + t * (-1.13520398 + t * (1.48851587 + t * (-0.82215223 + t * 0.17087277)))))))));
-  return x >= 0 ? r : 2 - r;
-}
-const above = (x: number, mean: number, sd: number): number =>
-  (x === -Infinity ? 1 : x === Infinity ? 0 : 0.5 * erfc((x - mean) / (sd * Math.SQRT2)));
-
-const sizes: Array<{ place: number; bin: number; p: number }> = [];
-const edges = task.size.edges;
-for (let placeIndex = 0; placeIndex < task.places; placeIndex++) {
-  const samples = placeSamples[placeIndex]!;
-  let mean = 0;
-  for (const sample of samples) mean += sample / SIMULATIONS;
-  let variance = 0;
-  for (const sample of samples) variance += (sample - mean) ** 2 / SIMULATIONS;
-  const sd = Math.sqrt(variance) * 1.5 + 0.08;
-  const empirical = new Uint32Array(edges.length + 1);
-  for (const sample of samples) {
-    let bin = 0;
-    while (bin < edges.length && sample >= edges[bin]!) bin++;
-    empirical[bin]!++;
+function main() {
+  const inputDirectory = process.env.MAKEFUN_INPUT_DIR || "/input";
+  const outputDirectory = process.env.MAKEFUN_OUTPUT_DIR || "/output";
+  const task = JSON.parse(
+    fs.readFileSync(path.join(inputDirectory, "task.json"), "utf8"),
+  );
+  const historyText = fs.readFileSync(
+    path.join(inputDirectory, "history.ndjson"),
+    "utf8",
+  );
+  const marks = readMarks(historyText);
+  if (marks.length === 0) throw new Error("History has no successful marks.");
+  if (!task || !task.size || !Array.isArray(task.size.edges)) {
+    throw new Error("Task is missing size edges.");
   }
-  for (let bin = 0; bin <= edges.length; bin++) {
-    const lo = bin === 0 ? -Infinity : edges[bin - 1]!;
-    const hi = bin === edges.length ? Infinity : edges[bin]!;
-    const wideNormalShare = above(lo, mean, sd) - above(hi, mean, sd);
-    const p = Math.floor((0.68 * (empirical[bin]! / SIMULATIONS) + 0.32 * wideNormalShare) * MICRO) / MICRO;
-    if (p > 0) sizes.push({ place: placeIndex + 1, bin, p });
-  }
+  const places = Number(task.places) || PLACES;
+  const candidates = collectCoins(marks);
+  const result = simulate(
+    candidates,
+    horizonHours(task),
+    task.size.edges,
+    places,
+  );
+  const outputPath = path.resolve(
+    outputDirectory,
+    task.output || "forecast.json",
+  );
+  fs.mkdirSync(path.dirname(outputPath), { recursive: true });
+  fs.writeFileSync(outputPath, JSON.stringify(result) + "\n");
 }
 
-mkdirSync(OUTPUT_DIR, { recursive: true });
-writeFileSync(join(OUTPUT_DIR, task.output), `${JSON.stringify({ probabilities, top5, sizes })}\n`);
+try {
+  main();
+} catch (error) {
+  console.error(error && error.stack ? error.stack : String(error));
+  process.exitCode = 1;
+}

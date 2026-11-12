@@ -1,7 +1,8 @@
 const fs = require("node:fs");
 const path = require("node:path");
 
-const SIMULATION_COUNT = 12000;
+// 15000 simulations smooth the Monte Carlo noise in the place shares.
+const SIMULATION_COUNT = 15000;
 const SEED = 20261112;
 const PLACES = 5;
 const MIN_REPORTED_PROBABILITY = 0.0006;
